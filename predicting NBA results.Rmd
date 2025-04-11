@@ -1,0 +1,619 @@
+---
+title: "Untitled"
+author: "Cecilia Liu"
+date: "2024-12-13"
+output: pdf_document
+---
+
+```{r}
+# Clear the environment
+rm(list = ls())
+
+# Set global chunk options
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+```
+
+```{r, message=FALSE, echo=FALSE}
+# Load necessary libraries
+library(readxl)
+library(caret)
+library(randomForest)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(data.table)
+library(zoo)
+library(parallel)    # For parallel processing
+library(doParallel)  # For parallel backend
+```
+
+```{r}
+# Load the dataset
+data <- read_excel("Dataset.xlsx")
+
+# Convert 'Game Date' to Date type and arrange data chronologically
+data <- data %>%
+  mutate(`Game Date` = as.Date(`Game Date`, format = "%m/%d/%Y")) %>%
+  arrange(`Game Date`)
+
+
+```
+
+```{r}
+# Define the split date for a 70/30 split
+split_date <- as.Date("2024-02-27")
+
+# Split the data
+training_data <- data %>%
+  filter(`Game Date` < split_date)
+
+testing_data <- data %>%
+  filter(`Game Date` >= split_date)
+
+```
+
+```{r}
+# Extract 'HomeTeam' and determine if it's a home game in training data
+training_data <- training_data %>%
+  mutate(
+    HomeTeam = ifelse(grepl(" vs. ", `Match Up`), 
+                      sub(" vs. .*", "", `Match Up`), 
+                      sub(".* @ ", "", `Match Up`)),
+    IsHomeGame = grepl(" vs. ", `Match Up`)
+  )
+
+# Calculate Home Win Rate (HWR) based on training data
+home_win_rate_train <- training_data %>%
+  filter(IsHomeGame) %>%
+  group_by(HomeTeam) %>%
+  summarise(
+    HomeWins = sum(`W/L` == "W"),
+    TotalHomeGames = n(),
+    HomeWinRate = HomeWins / TotalHomeGames
+  )
+
+# Merge HWR back to training data
+training_data <- training_data %>%
+  left_join(home_win_rate_train, by = "HomeTeam")
+
+# Calculate Avg_Score_Diff for training data
+training_data <- training_data %>%
+  group_by(Team) %>%
+  arrange(`Game Date`) %>%
+  mutate(
+    PastGames = row_number() - 1,
+    PastTotalPTS = cumsum(PTS) - PTS,
+    Avg_PTS_UpToDate = ifelse(PastGames > 0, PastTotalPTS / PastGames, NA_real_)
+  ) %>%
+  ungroup()
+
+# Extract Opponent information
+training_data <- training_data %>%
+  mutate(
+    Opponent = ifelse(grepl("@", `Match Up`),
+                      sub(".* @ ", "", `Match Up`),
+                      sub(".* vs\\. ?", "", `Match Up`))
+  )
+
+# Prepare opponent averages
+opponent_avgs_train <- training_data %>%
+  select(Opponent = Team, `Game Date`, OppAvg_PTS_UpToDate = Avg_PTS_UpToDate)
+
+setDT(training_data)
+setDT(opponent_avgs_train)
+
+# Perform a rolling join to get opponent's Avg_PTS_UpToDate up to the current Game Date
+training_data <- opponent_avgs_train[training_data, on = .(Opponent, `Game Date`), roll = Inf]
+
+# Calculate Avg_Score_Diff
+training_data[, Avg_Score_Diff := Avg_PTS_UpToDate - OppAvg_PTS_UpToDate]
+
+# Function to calculate consecutive wins or losses
+calculate_team_consecutive_streak <- function(data, win = TRUE) {
+  streak_column <- numeric(nrow(data))
+  for (i in seq_len(nrow(data))) {
+    if (i == 1) {
+      streak_column[i] <- 0
+      next
+    }
+    
+    current_team <- data$Team[i]
+    past_games <- data[1:(i - 1), ]
+    team_matches <- past_games[past_games$Team == current_team, ]
+    team_matches <- team_matches[order(team_matches$`Game Date`, decreasing = TRUE), ]
+    streak <- 0
+
+    for (j in seq_len(nrow(team_matches))) {
+      if ((win && team_matches$`W/L`[j] == "W") || (!win && team_matches$`W/L`[j] == "L")) {
+        streak <- streak + 1
+      } else {
+        streak <- 0
+        break
+      }
+    }
+    streak_column[i] <- ifelse(streak >= 3, streak, 0)
+  }
+  streak_column
+}
+
+# Calculate Consecutive Wins and Losses for training data
+training_data$Consecutive_Win_General <- calculate_team_consecutive_streak(training_data, win = TRUE)
+training_data$Consecutive_Loss_General <- calculate_team_consecutive_streak(training_data, win = FALSE)
+
+# Calculate team average PTS in training data
+team_avg_scores_train <- training_data %>%
+  group_by(Team) %>%
+  summarize(Team_Avg_PTS = mean(PTS, na.rm = TRUE))
+
+# Function to calculate weighted average PTS
+calculate_weighted_average <- function(team, target_date, data, team_avg_scores) {
+  past_games <- data %>%
+    filter(Team == team & `Game Date` < target_date)
+  
+  if (nrow(past_games) == 0) {
+    default_score <- team_avg_scores$Team_Avg_PTS[team_avg_scores$Team == team]
+    return(default_score)
+  }
+  
+  past_games <- past_games %>%
+    mutate(weight = 1 / (as.numeric(target_date - `Game Date`) + 1))
+  
+  weighted_avg_pts <- sum(past_games$PTS * past_games$weight, na.rm = TRUE) /
+                      sum(past_games$weight, na.rm = TRUE)
+  
+  weighted_avg_pts
+}
+
+# Calculate Weighted_Avg_PTS for training data
+training_data <- training_data %>%
+  rowwise() %>%
+  mutate(Weighted_Avg_PTS = calculate_weighted_average(Team, `Game Date`, training_data, team_avg_scores_train)) %>%
+  ungroup()
+
+# Calculate Shooting and Turnover stats for training data
+training_data <- training_data %>%
+  group_by(Team) %>%
+  arrange(`Game Date`) %>%
+  mutate(
+    PastFGM = cumsum(FGM) - FGM,
+    PastFGA = cumsum(FGA) - FGA,
+    Shooting_Pct_UpToDate = ifelse(row_number() > 1, PastFGM / PastFGA, NA_real_)
+  ) %>%
+  ungroup()
+
+training_data <- training_data %>%
+  group_by(Team) %>%
+  arrange(`Game Date`) %>%
+  mutate(
+    PastTOV = cumsum(TOV) - TOV,
+    PastGames_TOV = row_number() - 1,
+    Turnover_Rate_UpToDate = ifelse(PastGames_TOV > 0, PastTOV / PastGames_TOV, NA_real_)
+  ) %>%
+  ungroup()
+
+# Prepare opponent stats from training data
+opponent_stats_train <- training_data %>%
+  select(Opponent = Team, `Game Date`, Opp_Shooting_Pct_UpToDate = Shooting_Pct_UpToDate, Opp_Turnover_Rate_UpToDate = Turnover_Rate_UpToDate)
+
+setDT(training_data)
+setDT(opponent_stats_train)
+
+# Perform a rolling join to get opponent's stats up to the current Game Date
+training_data <- opponent_stats_train[training_data, on = .(Opponent, `Game Date`), roll = Inf]
+
+# Calculate differentials
+training_data[, Shooting_Differential := Shooting_Pct_UpToDate - Opp_Shooting_Pct_UpToDate]
+training_data[, Turnover_Differential := Turnover_Rate_UpToDate - Opp_Turnover_Rate_UpToDate]
+
+# Calculate Four Factor Metrics for training data
+training_data <- training_data %>%
+  mutate(
+    # Effective Field Goal Percentage (eFG%)
+    eFG = (FGM + 0.5 * `3PM`) / FGA,
+    
+    # Free Throw Rate (FTr)
+    FTr = FTA / FGA,
+    
+    # Three-Point Rate (3P_rate)
+    `3P_rate` = `3PA` / FGA
+  )
+
+# Calculate possessions and offensive rating for training data
+training_data <- training_data %>%
+  mutate(
+    Possessions = 0.96 * (FGA + TOV + 0.44 * FTA - OREB),
+    Off_Rating = ifelse(Possessions > 0, (PTS / Possessions) * 100, NA_real_)
+  )
+```
+
+```{r}
+# Extract 'HomeTeam' and determine if it's a home game in testing data
+testing_data <- testing_data %>%
+  mutate(
+    HomeTeam = ifelse(grepl(" vs. ", `Match Up`), 
+                      sub(" vs. .*", "", `Match Up`), 
+                      sub(".* @ ", "", `Match Up`)),
+    IsHomeGame = grepl(" vs. ", `Match Up`)
+  )
+
+# Merge HWR from training data to testing data
+testing_data <- testing_data %>%
+  left_join(home_win_rate_train, by = "HomeTeam")
+
+# Handle missing HWR (teams with no home games in training data)
+testing_data$HomeWinRate[is.na(testing_data$HomeWinRate)] <- 0
+
+# Calculate Avg_Score_Diff for testing data based on training data
+testing_data <- testing_data %>%
+  group_by(Team) %>%
+  arrange(`Game Date`) %>%
+  mutate(
+    PastGames = row_number() - 1,
+    PastTotalPTS = cumsum(PTS) - PTS,
+    Avg_PTS_UpToDate = ifelse(PastGames > 0, PastTotalPTS / PastGames, NA_real_)
+  ) %>%
+  ungroup()
+
+# Extract Opponent information
+testing_data <- testing_data %>%
+  mutate(
+    Opponent = ifelse(grepl("@", `Match Up`),
+                      sub(".* @ ", "", `Match Up`),
+                      sub(".* vs\\. ?", "", `Match Up`))
+  )
+
+# Prepare opponent averages from training data
+opponent_avgs_test <- training_data %>%
+  select(Opponent = Team, `Game Date`, OppAvg_PTS_UpToDate = Avg_PTS_UpToDate)
+
+setDT(testing_data)
+setDT(opponent_avgs_test)
+
+# Perform a rolling join to get opponent's Avg_PTS_UpToDate up to the current Game Date
+testing_data <- opponent_avgs_test[testing_data, on = .(Opponent, `Game Date`), roll = Inf]
+
+# Calculate Avg_Score_Diff
+testing_data[, Avg_Score_Diff := Avg_PTS_UpToDate - OppAvg_PTS_UpToDate]
+
+# Handle NAs resulting from opponents not present in training data
+testing_data$Avg_Score_Diff[is.na(testing_data$Avg_Score_Diff)] <- 0
+
+
+# Calculate Avg_Score_Diff for testing data based on training data
+testing_data <- testing_data %>%
+  group_by(Team) %>%
+  arrange(`Game Date`) %>%
+  mutate(
+    PastGames = row_number() - 1,
+    PastTotalPTS = cumsum(PTS) - PTS,
+    Avg_PTS_UpToDate = ifelse(PastGames > 0, PastTotalPTS / PastGames, NA_real_)
+  ) %>%
+  ungroup()
+
+# Extract Opponent information
+testing_data <- testing_data %>%
+  mutate(
+    Opponent = ifelse(grepl("@", `Match Up`),
+                      sub(".* @ ", "", `Match Up`),
+                      sub(".* vs\\. ?", "", `Match Up`))
+  )
+
+# Prepare opponent averages from training data
+opponent_avgs_test <- training_data %>%
+  select(Opponent = Team, `Game Date`, OppAvg_PTS_UpToDate = Avg_PTS_UpToDate)
+
+setDT(testing_data)
+setDT(opponent_avgs_test)
+
+# Perform a rolling join to get opponent's Avg_PTS_UpToDate up to the current Game Date
+testing_data <- opponent_avgs_test[testing_data, on = .(Opponent, `Game Date`), roll = Inf]
+
+# Calculate Avg_Score_Diff
+testing_data[, Avg_Score_Diff := Avg_PTS_UpToDate - OppAvg_PTS_UpToDate]
+
+# Handle NAs resulting from opponents not present in training data
+testing_data$Avg_Score_Diff[is.na(testing_data$Avg_Score_Diff)] <- 0
+
+# Function to calculate consecutive wins or losses based on training data
+calculate_team_consecutive_streak_testing <- function(train_data, test_data, win = TRUE) {
+  streak_column <- numeric(nrow(test_data))
+  for (i in seq_len(nrow(test_data))) {
+    current_game_date <- test_data$`Game Date`[i]
+    current_team <- test_data$Team[i]
+    
+    # Filter past games from training data
+    past_games <- train_data %>%
+      filter(Team == current_team & `Game Date` < current_game_date) %>%
+      arrange(`Game Date`, decreasing = TRUE)
+    
+    streak <- 0
+    for (j in seq_len(nrow(past_games))) {
+      if ((win && past_games$`W/L`[j] == "W") || (!win && past_games$`W/L`[j] == "L")) {
+        streak <- streak + 1
+      } else {
+        streak <- 0
+        break
+      }
+    }
+    streak_column[i] <- ifelse(streak >= 3, streak, 0)
+  }
+  streak_column
+}
+
+# Calculate Consecutive Wins and Losses for testing data
+testing_data$Consecutive_Win_General <- calculate_team_consecutive_streak_testing(training_data, testing_data, win = TRUE)
+testing_data$Consecutive_Loss_General <- calculate_team_consecutive_streak_testing(training_data, testing_data, win = FALSE)
+
+# Function to calculate weighted average PTS for testing data based on training data
+calculate_weighted_average_testing <- function(team, target_date, train_data, team_avg_scores) {
+  past_games <- train_data %>%
+    filter(Team == team & `Game Date` < target_date)
+  
+  if (nrow(past_games) == 0) {
+    default_score <- team_avg_scores_train$Team_Avg_PTS[team_avg_scores_train$Team == team]
+    return(default_score)
+  }
+  
+  past_games <- past_games %>%
+    mutate(weight = 1 / (as.numeric(target_date - `Game Date`) + 1))
+  
+  weighted_avg_pts <- sum(past_games$PTS * past_games$weight, na.rm = TRUE) /
+                      sum(past_games$weight, na.rm = TRUE)
+  
+  weighted_avg_pts
+}
+
+# Calculate Weighted_Avg_PTS for testing data
+testing_data <- testing_data %>%
+  rowwise() %>%
+  mutate(Weighted_Avg_PTS = calculate_weighted_average_testing(Team, `Game Date`, training_data, team_avg_scores_train)) %>%
+  ungroup()
+
+# Calculate Shooting and Turnover stats for testing data based on training data
+testing_data <- testing_data %>%
+  group_by(Team) %>%
+  arrange(`Game Date`) %>%
+  mutate(
+    PastFGM = cumsum(FGM) - FGM,
+    PastFGA = cumsum(FGA) - FGA,
+    Shooting_Pct_UpToDate = ifelse(row_number() > 1, PastFGM / PastFGA, NA_real_)
+  ) %>%
+  ungroup()
+
+testing_data <- testing_data %>%
+  group_by(Team) %>%
+  arrange(`Game Date`) %>%
+  mutate(
+    PastTOV = cumsum(TOV) - TOV,
+    PastGames_TOV = row_number() - 1,
+    Turnover_Rate_UpToDate = ifelse(PastGames_TOV > 0, PastTOV / PastGames_TOV, NA_real_)
+  ) %>%
+  ungroup()
+
+# Prepare opponent stats from training data
+opponent_stats_test <- training_data %>%
+  select(Opponent = Team, `Game Date`, Opp_Shooting_Pct_UpToDate = Shooting_Pct_UpToDate, Opp_Turnover_Rate_UpToDate = Turnover_Rate_UpToDate)
+
+setDT(testing_data)
+setDT(opponent_stats_test)
+
+# Perform a rolling join to get opponent's stats up to the current Game Date
+testing_data <- opponent_stats_test[testing_data, on = .(Opponent, `Game Date`), roll = Inf]
+
+# Calculate differentials
+testing_data[, Shooting_Differential := Shooting_Pct_UpToDate - Opp_Shooting_Pct_UpToDate]
+testing_data[, Turnover_Differential := Turnover_Rate_UpToDate - Opp_Turnover_Rate_UpToDate]
+
+# Handle NAs resulting from opponents not present in training data
+testing_data$Shooting_Differential[is.na(testing_data$Shooting_Differential)] <- 0
+testing_data$Turnover_Differential[is.na(testing_data$Turnover_Differential)] <- 0
+
+# Calculate Four Factor Metrics for testing data
+testing_data <- testing_data %>%
+  mutate(
+    # Effective Field Goal Percentage (eFG%)
+    eFG = (FGM + 0.5 * `3PM`) / FGA,
+    
+    # Free Throw Rate (FTr)
+    FTr = FTA / FGA,
+    
+    # Three-Point Rate (3P_rate)
+    `3P_rate` = `3PA` / FGA
+  )
+
+# Calculate possessions and offensive rating for testing data
+testing_data <- testing_data %>%
+  mutate(
+    Possessions = 0.96 * (FGA + TOV + 0.44 * FTA - OREB),
+    Off_Rating = ifelse(Possessions > 0, (PTS / Possessions) * 100, NA_real_)
+  )
+
+```
+
+```{r}
+# Select relevant columns for modeling in training data
+train_data <- training_data %>%
+  select(
+    `W/L`,
+    Avg_Score_Diff,
+    Weighted_Avg_PTS,
+    IsHomeGame,
+    HomeWinRate,
+    Shooting_Differential,
+    Turnover_Differential,
+    Consecutive_Win_General,
+    Consecutive_Loss_General,
+    eFG,
+    FTr,
+    Off_Rating
+  ) %>%
+  drop_na()
+
+# Select relevant columns for modeling in testing data
+test_data <- testing_data %>%
+  select(
+    `W/L`,
+    Avg_Score_Diff,
+    Weighted_Avg_PTS,
+    IsHomeGame,
+    HomeWinRate,
+    Shooting_Differential,
+    Turnover_Differential,
+    Consecutive_Win_General,
+    Consecutive_Loss_General,
+    eFG,
+    FTr,
+    Off_Rating
+  ) %>%
+  drop_na()
+
+```
+
+```{r}
+# Initialize the feature list and results dataframe
+remaining_features <- c("Avg_Score_Diff", "Weighted_Avg_PTS", "IsHomeGame", "HomeWinRate", "Shooting_Differential", "Turnover_Differential", "Consecutive_Win_General", "Consecutive_Loss_General", "eFG", "FTr", "Off_Rating")
+selected_features <- c()
+results <- data.frame(
+  Step = integer(),
+  Combination = character(),
+  Accuracy = numeric(),
+  stringsAsFactors = FALSE
+)
+```
+
+
+```{r}
+# Set the number of folds for cross-validation
+k_folds <- 5
+folds <- createFolds(train_data$`W/L`, k = k_folds, list = TRUE)
+
+# Forward selection loop with k-fold cross-validation
+step <- 1
+repeat {
+  best_accuracy <- 0
+  best_feature <- NULL
+
+  # Try adding each remaining feature
+  for (feature in remaining_features) {
+    current_features <- c(selected_features, feature)
+    formula <- as.formula(paste("factor(`W/L`) ~", paste(current_features, collapse = " + ")))
+
+    fold_accuracies <- c()
+
+    # Perform k-fold cross-validation
+    for (fold_index in seq_along(folds)) {
+      train_fold <- train_data[-folds[[fold_index]], ]
+      test_fold <- train_data[folds[[fold_index]], ]
+
+      # Train the Random Forest model
+      rf_model <- randomForest(
+        formula,
+        data = train_fold,
+        ntree = 500,
+        mtry = floor(sqrt(length(current_features))),
+        importance = TRUE
+      )
+
+      # Predict on the validation fold
+      predictions <- predict(rf_model, test_fold)
+
+      # Calculate accuracy for the fold
+      confusion_matrix <- table(Predicted = predictions, Actual = test_fold$`W/L`)
+      accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+
+      fold_accuracies <- c(fold_accuracies, accuracy)
+    }
+
+    # Calculate the average accuracy across folds
+    avg_accuracy <- mean(fold_accuracies)
+
+    # Update the best feature if this one improves accuracy
+    if (avg_accuracy > best_accuracy) {
+      best_accuracy <- avg_accuracy
+      best_feature <- feature
+    }
+  }
+
+  # Stop if no improvement
+  if (is.null(best_feature)) break
+
+  # Add the best feature to the selected list
+  selected_features <- c(selected_features, best_feature)
+  remaining_features <- setdiff(remaining_features, best_feature)
+
+  # Log the results
+  results <- rbind(
+    results,
+    data.frame(
+      Step = step,
+      Combination = paste(selected_features, collapse = ", "),
+      Accuracy = round(best_accuracy * 100, 2),
+      stringsAsFactors = FALSE
+    )
+  )
+
+  # Increment the step counter
+  step <- step + 1
+
+  # Stop if all features are selected
+  if (length(remaining_features) == 0) break
+}
+```
+
+```{r}
+# Rename feature abbreviations for brevity
+results$Combination <- gsub("Avg_Score_Diff", "ASD", results$Combination)
+results$Combination <- gsub("Weighted_Avg_PTS", "WAP", results$Combination)
+results$Combination <- gsub("IsHomeGame", "IHG", results$Combination)
+results$Combination <- gsub("HomeWinRate", "HWR", results$Combination)
+results$Combination <- gsub("Shooting_Differential", "SD", results$Combination)
+results$Combination <- gsub("Turnover_Differential", "TD", results$Combination)
+results$Combination <- gsub("Consecutive_Win_General", "CWG", results$Combination)
+results$Combination <- gsub("Consecutive_Loss_General", "CLG", results$Combination)
+results$Combination <- gsub("eFG", "eFG", results$Combination)
+results$Combination <- gsub("FTr", "FTr", results$Combination)
+results$Combination <- gsub("Off_Rating", "OR", results$Combination)
+
+# Extract the best combination for each feature count
+results <- results %>%
+  mutate(Num_Features = sapply(strsplit(Combination, ","), length))
+
+best_combinations <- results %>%
+  group_by(Num_Features) %>%
+  filter(Accuracy == max(Accuracy)) %>%
+  ungroup()
+
+# Visualize the best combinations for each feature count
+knitr::kable(best_combinations, caption = "Best Feature Combinations by Feature Count")
+
+print("Best Feature Combination Overall:")
+print(best_combinations[which.max(best_combinations$Accuracy), ])
+
+ggplot(best_combinations, aes(x = Num_Features, y = Accuracy)) +
+  geom_line(color = "skyblue", size = 1) +
+  geom_point(size = 3, color = "blue") +
+  labs(
+    title = "Accuracy vs Number of Features",
+    x = "Number of Features",
+    y = "Accuracy (%)"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Create a table for abbreviations
+abbreviations <- data.frame(
+  Abbreviation = c("ASD", "WAP", "IHG", "HWR", "SD", "TD", "CWG", "CLG", 
+                   "eFG", "FTr", "OR"),
+  Meaning = c("Avg_Score_Diff", "Weighted_Avg_PTS", "IsHomeGame", 
+              "HomeWinRate", "Shooting_Differential", "Turnover_Differential", 
+              "Consecutive_Win_General", "Consecutive_Loss_General", 
+              "Effective Field Goal %", "Free Throw Rate", "Offensive Rating")
+)
+
+# Display the abbreviation table
+kable(abbreviations, caption = "Abbreviation Table")
+```
