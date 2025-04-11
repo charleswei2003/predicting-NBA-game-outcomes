@@ -1,1 +1,5 @@
 # predicting-NBA-game-outcomes
+
+## Overview
+
+The 2023 NBA regular season saw fierce competition among 30 teams, culminating in a dataset of 2,460 games. Each game is characterized by 24 features, capturing key statistics such as points scored, field goals, assists, and rebounds. Meanwhile, predicting basketball game outcomes has always been a hot topic among fans. Most people rely on intuition to classify teams into strong and weak categories, they firmly believe that strong teams will defeat weaker ones. While a few are deeply engrossed in data, using numbers to determine the winners. Based on this dataset, we aim to consider six factors - Average Score Difference, Weighted Average of a Team's Historical Points Scored, Home Advantage, Consecutive Wins/Losses, to be filled, and Previous Head-to-head Results to build a predictive model, striving for higher prediction accuracy. Also, understanding the dynamics that lead to winning or losing a game helps teams make informed decisions regarding strategy and player performance improvements.
